@@ -1,4 +1,4 @@
-# Optimized person detection with counting for drone streaming
+# Optimized person detection with simple count for drone streaming
 import os
 os.environ['YOLO_CONFIG_DIR'] = '/tmp'
 
@@ -11,9 +11,9 @@ from flask_socketio import SocketIO
 import json
 import time
 
-# Export model with optimized settings for person detection
+# Export model with optimized settings for person detection - NO SIMPLIFICATION to prevent Pi restart
 model = YOLO('yolov8n.pt')
-model.export(format='onnx', opset=11, simplify=True, imgsz=320)
+model.export(format='onnx', opset=11, simplify=False, imgsz=320)  # Simplify disabled to reduce memory usage
 
 class PersonDetectorONNX:
     def __init__(self, onnx_model_path, conf_threshold=0.35, iou_threshold=0.4):
@@ -31,7 +31,6 @@ class PersonDetectorONNX:
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.input_shape = (320, 320)
-        self.person_count = 0  # Track person count
 
     def preprocess(self, image):
         # Resize to 320x320 for speed
@@ -178,9 +177,9 @@ def generate_frames():
             cv2.putText(frame, label, (x1, y1 - 10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        # Add person count overlay
-        cv2.rectangle(frame, (10, 10), (200, 60), (0, 0, 0), -1)  # Black background
-        cv2.putText(frame, f"People Detected: {person_count}", (20, 40), 
+        # Add person count overlay (simplified)
+        cv2.rectangle(frame, (10, 10), (150, 50), (0, 0, 0), -1)  # Black background
+        cv2.putText(frame, f"Count: {person_count}", (20, 35), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
         # Update detection data
@@ -214,7 +213,6 @@ def index():
             .container { display: flex; flex-direction: column; align-items: center; }
             #video-feed { border: 2px solid #333; width: 640px; height: 480px; }
             #detection-info { margin-top: 20px; padding: 10px; background: #f0f0f0; border-radius: 5px; }
-            .detection { margin: 5px 0; padding: 5px; background: #e0ffe0; border-radius: 3px; }
             .count-display { 
                 font-size: 24px; 
                 font-weight: bold; 
@@ -233,8 +231,6 @@ def index():
             <div id="detection-info">
                 <h3>People Count:</h3>
                 <div class="count-display" id="person-count">0 people detected</div>
-                <h3>Individual Detections:</h3>
-                <div id="detections">No persons detected yet</div>
             </div>
         </div>
         
@@ -243,24 +239,9 @@ def index():
             
             socket.on('detection', function(data) {
                 const countDiv = document.getElementById('person-count');
-                const detectionsDiv = document.getElementById('detections');
                 
-                // Update count display
-                countDiv.innerHTML = `${data.count} person${data.count !== 1 ? 's' : ''} detected`;
-                
-                // Update individual detections
-                if (data.boxes.length > 0) {
-                    let html = '';
-                    for (let i = 0; i < data.boxes.length; i++) {
-                        const detectionDiv = document.createElement('div');
-                        detectionDiv.className = 'detection';
-                        detectionDiv.innerHTML = `<strong>Person ${i + 1}</strong>: ${data.scores[i].toFixed(2)} confidence`;
-                        html += detectionDiv.outerHTML;
-                    }
-                    detectionsDiv.innerHTML = html;
-                } else {
-                    detectionsDiv.innerHTML = 'No persons detected';
-                }
+                // Update count display - changed to just "Count: X"
+                countDiv.innerHTML = `Count: ${data.count}`;
             });
         </script>
     </body>
@@ -273,7 +254,7 @@ def video_feed():
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def main():
-    print("Starting person detection web server with counting...")
+    print("Starting person detection web server with simplified counting...")
     print("Access stream at: http://<raspberry-pi-ip>:5000")
     socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
