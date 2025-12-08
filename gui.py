@@ -206,7 +206,7 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Person Detection Stream</title>
+        <title>Object Detection  Stream</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <style>
             body { margin: 0; padding: 20px; font-family: Arial, sans-serif; }
