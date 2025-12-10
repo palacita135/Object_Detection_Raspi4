@@ -6,6 +6,10 @@ Object Detection in Raspberry Pi 4 with Yolov8n
 sudo apt update
 sudo apt install python3-pip python3-venv libatlas-base-dev libhdf5-dev libhdf5-serial-dev libhdf5-103
 pip3 install ultralytics onnx onnxruntime opencv-python-headless flask flask-socketio pillow numpy
+
+sudo apt install pigpio python3-pigpio
+sudo systemctl enable pigpiod
+sudo systemctl start pigpiod
 ```
 
 **Wiring Diagram:**
