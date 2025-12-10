@@ -7,10 +7,50 @@ sudo apt update
 sudo apt install python3-pip python3-venv libatlas-base-dev libhdf5-dev libhdf5-serial-dev libhdf5-103
 pip3 install ultralytics onnx onnxruntime opencv-python-headless flask flask-socketio pillow numpy
 
-sudo apt install pigpio python3-pigpio
-sudo systemctl enable pigpiod
-sudo systemctl start pigpiod
+# Install RPi.GPIO via pip (more reliable on Ubuntu)
+pip3 install RPi.GPIO
+
+# Install system dependencies
+sudo apt update
+sudo apt install python3-dev python3-pip
+
+# For hardware PWM support (optional but recommended)
+sudo apt install wiringpi
+
+# Download and build pigpio from source
+wget https://github.com/jgarff/rpi_ws281x/archive/master.zip
+unzip master.zip
+cd rpi_ws281x-master
+make
+sudo make install
+
+# Or install via git
+git clone https://github.com/jgarff/rpi_ws281x.git
+cd rpi_ws281x
+make
+sudo make install
+
+# Install Python wrapper
+pip3 install rpi.gpio
 ```
+For your servo application, the standard RPi.GPIO will work fine. The original code should run after installing:
+```bash
+pip3 install RPi.GPIO
+```
+Test with:
+```bash
+python3 -c "import RPi.GPIO as GPIO; print('GPIO OK')"
+```
+Then run your script:
+```bash
+python3 tracking_object.py
+```
+If you encounter permission errors later, add your user to gpio group:
+```bash
+sudo usermod -a -G gpio $USER
+```
+And log out/in or reboot.
+---
 
 **Wiring Diagram:**
 ```bash
