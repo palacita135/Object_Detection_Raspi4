@@ -6,6 +6,7 @@ Object Detection in Raspberry Pi 4 with Yolov8n
 sudo apt update
 sudo apt install python3-pip python3-venv libatlas-base-dev libhdf5-dev libhdf5-serial-dev libhdf5-103
 pip3 install ultralytics onnx onnxruntime opencv-python-headless flask flask-socketio pillow numpy
+sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly libgstreamer1.0-dev libgstrtspserver-1.0-dev
 
 # Install RPi.GPIO via pip (more reliable on Ubuntu)
 pip3 install RPi.GPIO
