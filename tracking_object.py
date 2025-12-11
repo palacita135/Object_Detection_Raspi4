@@ -19,7 +19,7 @@ model = YOLO('yolov8n.pt')
 model.export(format='onnx', opset=11, simplify=False, imgsz=320)  # Simplify disabled to reduce memory usage
 
 class ServoController:
-    def __init__(self, pan_pin=12, tilt_pin=13, freq=50):
+    def __init__(self, pan_pin=17, tilt_pin=27, freq=50):
         """
         Pan-Tilt servo controller for object tracking
         :param pan_pin: GPIO pin for pan servo (horizontal)
@@ -38,16 +38,60 @@ class ServoController:
         self.pan_servo = GPIO.PWM(self.pan_pin, freq)
         self.tilt_servo = GPIO.PWM(self.tilt_pin, freq)
         
-        # Start PWM with neutral position (7.5% duty cycle = 90 degrees)
-        self.pan_servo.start(7.5)  # 90° (center)
-        self.tilt_servo.start(7.5)  # 90° (center)
+        # Start PWM
+        self.pan_servo.start(0)  # Start with 0% duty cycle (stopped)
+        self.tilt_servo.start(0)  # Start with 0% duty cycle (stopped)
         
         # Current angles (degrees)
-        self.pan_angle = 90
-        self.tilt_angle = 90
+        self.pan_angle = 0    # Start pan at 0° (center)
+        self.tilt_angle = 90  # Start tilt at 90° (flat/forward)
         
         # Lock for thread safety
         self.lock = threading.Lock()
+        
+        # Initialize servos with full calibration sweep
+        self.calibrate_servos()
+
+    def calibrate_servos(self):
+        """Calibrate servos by sweeping full range (0-180°) for both pan and tilt"""
+        print("Starting servo calibration (full sweep)...")
+        
+        # Start with servos stopped
+        self.pan_servo.ChangeDutyCycle(0)
+        self.tilt_servo.ChangeDutyCycle(0)
+        time.sleep(0.5)
+        
+        print("Calibrating pan servo (0° to 180°)...")
+        # Sweep pan servo from 0 to 180 degrees
+        for angle in range(0, 181, 5):
+            self.pan_servo.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
+            time.sleep(0.05)
+        self.pan_angle = 180
+        time.sleep(0.5)  # Pause at end
+        
+        # Return pan to 0
+        print("Returning pan servo to 0°...")
+        for angle in range(180, -1, -5):
+            self.pan_servo.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
+            time.sleep(0.05)
+        self.pan_angle = 0
+        
+        print("Calibrating tilt servo (0° to 180°)...")
+        # Sweep tilt servo from 0 to 180 degrees
+        for angle in range(0, 181, 5):
+            self.tilt_servo.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
+            time.sleep(0.05)
+        self.tilt_angle = 180
+        time.sleep(0.5)  # Pause at end
+        
+        # Return tilt to 90 (flat position)
+        print("Returning tilt servo to 90° (flat)...")
+        for angle in range(180, 89, -5):
+            self.tilt_servo.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
+            time.sleep(0.05)
+        self.tilt_angle = 90
+        
+        print("Servos calibrated - Pan: 0°, Tilt: 90°")
 
     def move_to_angle(self, servo, angle):
         """
@@ -73,8 +117,8 @@ class ServoController:
             self.move_to_angle(self.tilt_servo, self.tilt_angle)
 
     def center_servos(self):
-        """Center both servos to 90 degrees"""
-        self.set_pan_angle(90)
+        """Center servos - Pan: 0°, Tilt: 90° (flat/forward)"""
+        self.set_pan_angle(0)
         self.set_tilt_angle(90)
 
     def cleanup(self):
@@ -205,13 +249,20 @@ class PersonDetectorONNX:
 
 # Initialize detector and servo controller
 detector = PersonDetectorONNX('yolov8n.onnx')
-servo_controller = ServoController(pan_pin=12, tilt_pin=13)  # GPIO pins for servos
+servo_controller = ServoController(pan_pin=17, tilt_pin=27)  # GPIO pins for servos - UPDATED
 
 # Flask app for web streaming
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 latest_detection = {"boxes": [], "labels": [], "scores": [], "count": 0}
+# Tracking control state
+tracking_state = {
+    "manual_control": False,  # True when in manual mode
+    "auto_tracking": True,    # True when auto tracking is enabled
+    "current_pan": 0,         # Start at 0°
+    "current_tilt": 90        # Start at 90° (flat/forward)
+}
 
 def track_object(boxes_scaled, frame_shape):
     """
@@ -219,9 +270,14 @@ def track_object(boxes_scaled, frame_shape):
     :param boxes_scaled: Detected bounding boxes in original frame scale
     :param frame_shape: Shape of the original frame
     """
+    # Only track if auto tracking is enabled
+    if not tracking_state["auto_tracking"]:
+        return
+    
     if len(boxes_scaled) == 0:
-        # No detections - center servos
+        # No detections - center servos (to 0° pan, 90° tilt)
         servo_controller.center_servos()
+        print("No detections - centering servos to 0° pan, 90° tilt")
         return
     
     # Find largest person (by area)
@@ -248,25 +304,41 @@ def track_object(boxes_scaled, frame_shape):
     error_x = center_x - (frame_width / 2)
     error_y = center_y - (frame_height / 2)
     
+    # Only adjust if person is significantly off-center (deadzone)
+    deadzone_pixels = 30  # Minimum deviation before adjusting
+    if abs(error_x) < deadzone_pixels and abs(error_y) < deadzone_pixels:
+        print(f"Within deadzone, skipping adjustment. Error: ({error_x:.1f}, {error_y:.1f})")
+        return  # Don't adjust if within deadzone
+    
     # Convert pixel error to angle adjustment (proportional control)
     # Adjust these values based on your desired sensitivity
-    pan_adjustment = (error_x / frame_width) * 45  # Max 45° adjustment
-    tilt_adjustment = -(error_y / frame_height) * 45  # Invert Y-axis
+    max_angle_change = 15  # Maximum angle change per update to prevent jerky movements
+    pan_adjustment = (error_x / frame_width) * 60  # Max 60° total adjustment range
+    tilt_adjustment = -(error_y / frame_height) * 60  # Invert Y-axis
+    
+    # Limit the adjustment amount
+    pan_adjustment = max(-max_angle_change, min(max_angle_change, pan_adjustment))
+    tilt_adjustment = max(-max_angle_change, min(max_angle_change, tilt_adjustment))
     
     # Get current angles
     current_pan = servo_controller.pan_angle
     current_tilt = servo_controller.tilt_angle
     
-    # Calculate new angles
+    # Calculate new angles (around 0° pan, 90° tilt center)
     new_pan = max(0, min(180, current_pan + pan_adjustment))
     new_tilt = max(0, min(180, current_tilt + tilt_adjustment))
+    
+    print(f"Tracking - Center: ({center_x:.1f}, {center_y:.1f}), "
+          f"Error: ({error_x:.1f}, {error_y:.1f}), "
+          f"Current: ({current_pan:.1f}, {current_tilt:.1f}), "
+          f"New: ({new_pan:.1f}, {new_tilt:.1f})")
     
     # Update servos
     servo_controller.set_pan_angle(new_pan)
     servo_controller.set_tilt_angle(new_tilt)
 
 def generate_frames():
-    global latest_detection
+    global latest_detection, tracking_state
     
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -275,7 +347,7 @@ def generate_frames():
     
     # Frame rate control
     fps_controller = 0
-    servo_update_interval = 5  # Update servos every N frames
+    servo_update_interval = 10  # Update servos every 10 frames (was 5)
     
     while True:
         ret, frame = cap.read()
@@ -289,10 +361,13 @@ def generate_frames():
         # Calculate person count
         person_count = len(boxes)
         
-        # Scale boxes back to original frame size
-        boxes_scaled = boxes.copy()
-        boxes_scaled[:, [0, 2]] *= (frame.shape[1] / 320.0)
-        boxes_scaled[:, [1, 3]] *= (frame.shape[0] / 320.0)
+        # Scale boxes back to original frame size (only if detections exist)
+        if len(boxes) > 0:
+            boxes_scaled = boxes.copy()
+            boxes_scaled[:, [0, 2]] *= (frame.shape[1] / 320.0)  # x1, x2
+            boxes_scaled[:, [1, 3]] *= (frame.shape[0] / 320.0)  # y1, y2
+        else:
+            boxes_scaled = np.array([]).reshape(0, 4)  # Empty array with correct shape
         
         # Track object with servos (every N frames to reduce jitter)
         if fps_controller % servo_update_interval == 0:
@@ -300,28 +375,31 @@ def generate_frames():
         
         fps_controller += 1
         
-        # Draw ONLY person bounding boxes (green)
-        for box, score in zip(boxes_scaled, scores):
-            x1, y1, x2, y2 = map(int, box)
-            label = f"Person: {score:.2f}"
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)  # Thick green box
-            cv2.putText(frame, label, (x1, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # Draw ONLY person bounding boxes (green) - only if detections exist
+        if len(boxes_scaled) > 0:
+            for box, score in zip(boxes_scaled, scores):
+                x1, y1, x2, y2 = map(int, box)
+                label = f"Person: {score:.2f}"
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)  # Thick green box
+                cv2.putText(frame, label, (x1, y1 - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
         # Add person count overlay (simplified)
         cv2.rectangle(frame, (10, 10), (150, 50), (0, 0, 0), -1)  # Black background
         cv2.putText(frame, f"Count: {person_count}", (20, 35), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
-        # Update detection data
+        # Update detection data - convert numpy types to native Python types
         latest_detection = {
             "boxes": [[int(x) for x in box] for box in boxes_scaled],
             "labels": ["person"] * len(class_ids),
-            "scores": [float(score) for score in scores],
-            "count": person_count,
+            "scores": [float(score.item()) for score in scores] if len(scores) > 0 else [],
+            "count": int(person_count),  # Ensure it's a Python int
             "timestamp": time.time(),
-            "pan_angle": servo_controller.pan_angle,
-            "tilt_angle": servo_controller.tilt_angle
+            "pan_angle": float(servo_controller.pan_angle),  # Ensure it's a Python float
+            "tilt_angle": float(servo_controller.tilt_angle),  # Ensure it's a Python float
+            "manual_control": tracking_state["manual_control"],
+            "auto_tracking": tracking_state["auto_tracking"]
         }
         
         socketio.emit('detection', latest_detection)
@@ -359,6 +437,61 @@ def index():
                 margin-top: 10px;
                 font-size: 16px;
             }
+            .control-panel {
+                margin-top: 20px;
+                padding: 15px;
+                background: #e0e0e0;
+                border-radius: 5px;
+                text-align: center;
+            }
+            .calibration-btn {
+                background-color: #4CAF50;
+                color: white;
+                padding: 10px 20px;
+                margin: 5px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 16px;
+            }
+            .calibration-btn:hover {
+                background-color: #45a049;
+            }
+            .manual-controls {
+                margin-top: 15px;
+            }
+            .manual-btn {
+                background-color: #2196F3;
+                color: white;
+                padding: 8px 16px;
+                margin: 3px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+            }
+            .manual-btn:hover {
+                background-color: #1976D2;
+            }
+            .toggle-btn {
+                background-color: #FF9800;
+                color: white;
+                padding: 8px 16px;
+                margin: 3px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 14px;
+            }
+            .toggle-btn:hover {
+                background-color: #F57C00;
+            }
+            .active {
+                background-color: #4CAF50 !important;
+            }
+            .inactive {
+                background-color: #f44336 !important;
+            }
         </style>
     </head>
     <body>
@@ -369,27 +502,120 @@ def index():
                 <h3>People Count:</h3>
                 <div class="count-display" id="person-count">0 people detected</div>
                 <div class="servo-info">
-                    <p>Pan Angle: <span id="pan-angle">90°</span></p>
+                    <p>Pan Angle: <span id="pan-angle">0°</span></p>
                     <p>Tilt Angle: <span id="tilt-angle">90°</span></p>
                 </div>
             </div>
+
+            <!-- Full Servo Calibration -->
+            <div class="control-panel">
+                <h3>Servo Calibration</h3>
+                <button class="calibration-btn" onclick="calibrateServos()">Full Calibration</button>
+            </div>
+
+            <!-- Tracking Control -->
+            <div class="control-panel">
+                <h3>Tracking Control</h3>
+                <button id="manual-btn" class="toggle-btn" onclick="toggleManualControl()">Manual Control: OFF</button>
+                <button id="auto-track-btn" class="toggle-btn active" onclick="toggleAutoTracking()">Auto Tracking: ON</button>
+            </div>
+
+            <!-- Manual Controls -->
+            <div class="control-panel">
+                <h3>Manual Control</h3>
+                <div class="manual-controls">
+                    <button class="manual-btn" onclick="adjustPan(-5)">Pan Left (-5°)</button>
+                    <button class="manual-btn" onclick="adjustPan(5)">Pan Right (+5°)</button>
+                    <br>
+                    <button class="manual-btn" onclick="adjustTilt(-5)">Tilt Up (-5°)</button>
+                    <button class="manual-btn" onclick="adjustTilt(5)">Tilt Down (+5°)</button>
+                </div>
+            </div>
         </div>
-        
+
         <script>
             const socket = io();
-            
+            let manualControlActive = false;
+            let autoTrackingActive = true;
+
             socket.on('detection', function(data) {
                 const countDiv = document.getElementById('person-count');
                 const panAngleDiv = document.getElementById('pan-angle');
                 const tiltAngleDiv = document.getElementById('tilt-angle');
-                
+
                 // Update count display
                 countDiv.innerHTML = `Count: ${data.count}`;
-                
+
                 // Update servo angles
                 panAngleDiv.innerHTML = `${data.pan_angle.toFixed(1)}°`;
                 tiltAngleDiv.innerHTML = `${data.tilt_angle.toFixed(1)}°`;
+                
+                // Update button states based on server state
+                updateButtonStates(data.manual_control, data.auto_tracking);
             });
+
+            function updateButtonStates(manual, auto) {
+                manualControlActive = manual;
+                autoTrackingActive = auto;
+                
+                const manualBtn = document.getElementById('manual-btn');
+                const autoBtn = document.getElementById('auto-track-btn');
+                
+                if (manual) {
+                    manualBtn.textContent = 'Manual Control: ON';
+                    manualBtn.classList.add('active');
+                    manualBtn.classList.remove('inactive');
+                } else {
+                    manualBtn.textContent = 'Manual Control: OFF';
+                    manualBtn.classList.remove('active');
+                    manualBtn.classList.add('inactive');
+                }
+                
+                if (auto) {
+                    autoBtn.textContent = 'Auto Tracking: ON';
+                    autoBtn.classList.add('active');
+                    autoBtn.classList.remove('inactive');
+                } else {
+                    autoBtn.textContent = 'Auto Tracking: OFF';
+                    autoBtn.classList.remove('active');
+                    autoBtn.classList.add('inactive');
+                }
+            }
+
+            function calibrateServos() {
+                socket.emit('manual_control', { command: 'calibrate' });
+                console.log('Calibrating servos (full sweep)...');
+            }
+
+            function toggleManualControl() {
+                const newState = !manualControlActive;
+                socket.emit('manual_control', { command: 'toggle_manual', value: newState });
+                console.log(`Toggled manual control: ${newState}`);
+            }
+
+            function toggleAutoTracking() {
+                const newState = !autoTrackingActive;
+                socket.emit('manual_control', { command: 'toggle_auto', value: newState });
+                console.log(`Toggled auto tracking: ${newState}`);
+            }
+
+            function adjustPan(angle) {
+                if (!manualControlActive) {
+                    alert('Enable manual control first!');
+                    return;
+                }
+                socket.emit('manual_control', { command: 'adjust_pan', value: angle });
+                console.log(`Adjusting pan by ${angle}°`);
+            }
+
+            function adjustTilt(angle) {
+                if (!manualControlActive) {
+                    alert('Enable manual control first!');
+                    return;
+                }
+                socket.emit('manual_control', { command: 'adjust_tilt', value: angle });
+                console.log(`Adjusting tilt by ${angle}°`);
+            }
         </script>
     </body>
     </html>
@@ -400,6 +626,46 @@ def video_feed():
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@socketio.on('manual_control')
+def handle_manual_control(data):
+    """Handle manual servo control commands from web interface"""
+    global tracking_state
+    
+    command = data.get('command')
+    
+    if command == 'calibrate':
+        # Re-calibrate servos with full sweep
+        print("Re-calibrating servos (full sweep)...")
+        servo_controller.calibrate_servos()
+        tracking_state["current_pan"] = 0
+        tracking_state["current_tilt"] = 90
+    elif command == 'toggle_manual':
+        new_state = data.get('value', False)
+        tracking_state["manual_control"] = new_state
+        print(f"Manual control: {new_state}")
+        if new_state:
+            # Store current angles when switching to manual
+            tracking_state["current_pan"] = servo_controller.pan_angle
+            tracking_state["current_tilt"] = servo_controller.tilt_angle
+    elif command == 'toggle_auto':
+        new_state = data.get('value', True)
+        tracking_state["auto_tracking"] = new_state
+        print(f"Auto tracking: {new_state}")
+    elif command == 'adjust_pan':
+        if tracking_state["manual_control"]:
+            angle_delta = data.get('value', 0)
+            new_angle = servo_controller.pan_angle + angle_delta
+            servo_controller.set_pan_angle(new_angle)
+            tracking_state["current_pan"] = new_angle
+            print(f"Manual pan adjustment: {angle_delta}°, new angle: {new_angle}")
+    elif command == 'adjust_tilt':
+        if tracking_state["manual_control"]:
+            angle_delta = data.get('value', 0)
+            new_angle = servo_controller.tilt_angle + angle_delta
+            servo_controller.set_tilt_angle(new_angle)
+            tracking_state["current_tilt"] = new_angle
+            print(f"Manual tilt adjustment: {angle_delta}°, new angle: {new_angle}")
+
 def cleanup():
     """Cleanup function for graceful shutdown"""
     servo_controller.cleanup()
@@ -407,7 +673,8 @@ def cleanup():
 def main():
     print("Starting person detection web server with servo tracking...")
     print("Access stream at: http://<raspberry-pi-ip>:5000")
-    print("Pan servo: GPIO 12, Tilt servo: GPIO 13")
+    print("Pan servo: GPIO 17, Tilt servo: GPIO 27") # Updated print
+    print("Servos calibrated and set to 0° pan, 90° tilt (flat/forward) center position.")
     
     try:
         socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
