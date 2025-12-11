@@ -16,6 +16,15 @@ pip3 install RPi.GPIO
 sudo apt update
 sudo apt install python3-dev python3-pip
 
+# Update pip to the latest version first (recommended)
+pip3 install --upgrade pip
+
+# Install the libraries
+pip3 install opencv-contrib-python numpy scipy matplotlib ultralytics
+
+# If you prefer the basic OpenCV without contrib modules, use:
+# pip3 install opencv-python numpy scipy matplotlib ultralytics
+
 # For hardware PWM support (optional but recommended)
 sudo apt install wiringpi
 
