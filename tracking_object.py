@@ -19,15 +19,17 @@ model = YOLO('yolov8n.pt')
 model.export(format='onnx', opset=11, simplify=False, imgsz=320)  # Simplify disabled to reduce memory usage
 
 class ServoController:
-    def __init__(self, pan_pin=17, tilt_pin=27, freq=50):
+    def __init__(self, pan_pin=17, tilt_pin=27, freq=50, smooth_factor=0.15):
         """
         Pan-Tilt servo controller for object tracking
         :param pan_pin: GPIO pin for pan servo (horizontal)
         :param tilt_pin: GPIO pin for tilt servo (vertical)
         :param freq: PWM frequency (typically 50Hz for servos)
+        :param smooth_factor: Factor for smooth interpolation (0.0 = instant, 1.0 = no movement)
         """
         self.pan_pin = pan_pin
         self.tilt_pin = tilt_pin
+        self.smooth_factor = smooth_factor # Store the smoothing factor
         
         # Set GPIO mode
         GPIO.setmode(GPIO.BCM)
@@ -42,9 +44,13 @@ class ServoController:
         self.pan_servo.start(0)  # Start with 0% duty cycle (stopped)
         self.tilt_servo.start(0)  # Start with 0% duty cycle (stopped)
         
-        # Current angles (degrees)
-        self.pan_angle = 0    # Start pan at 0° (center)
-        self.tilt_angle = 90  # Start tilt at 90° (flat/forward)
+        # Current angles (degrees) - these are the actual physical angles
+        self.current_pan_angle = 0    # Start pan at 0° (center)
+        self.current_tilt_angle = 90  # Start tilt at 90° (flat/forward)
+        
+        # Target angles (degrees) - these are where we want to go
+        self.target_pan_angle = self.current_pan_angle
+        self.target_tilt_angle = self.current_tilt_angle
         
         # Lock for thread safety
         self.lock = threading.Lock()
@@ -66,7 +72,8 @@ class ServoController:
         for angle in range(0, 181, 5):
             self.pan_servo.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
             time.sleep(0.05)
-        self.pan_angle = 180
+        self.current_pan_angle = 180
+        self.target_pan_angle = 180
         time.sleep(0.5)  # Pause at end
         
         # Return pan to 0
@@ -74,14 +81,16 @@ class ServoController:
         for angle in range(180, -1, -5):
             self.pan_servo.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
             time.sleep(0.05)
-        self.pan_angle = 0
+        self.current_pan_angle = 0
+        self.target_pan_angle = 0
         
         print("Calibrating tilt servo (0° to 180°)...")
         # Sweep tilt servo from 0 to 180 degrees
         for angle in range(0, 181, 5):
             self.tilt_servo.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
             time.sleep(0.05)
-        self.tilt_angle = 180
+        self.current_tilt_angle = 180
+        self.target_tilt_angle = 180
         time.sleep(0.5)  # Pause at end
         
         # Return tilt to 90 (flat position)
@@ -89,13 +98,14 @@ class ServoController:
         for angle in range(180, 89, -5):
             self.tilt_servo.ChangeDutyCycle(2.5 + (angle / 180.0) * 10.0)
             time.sleep(0.05)
-        self.tilt_angle = 90
+        self.current_tilt_angle = 90
+        self.target_tilt_angle = 90
         
         print("Servos calibrated - Pan: 0°, Tilt: 90°")
 
     def move_to_angle(self, servo, angle):
         """
-        Move servo to specific angle
+        Move servo to specific angle (non-smooth)
         :param servo: PWM object
         :param angle: Angle in degrees (0-180)
         """
@@ -104,20 +114,55 @@ class ServoController:
         servo.ChangeDutyCycle(duty_cycle)
         time.sleep(0.05)  # Small delay for smooth movement
 
+    def smooth_move_to_angle(self, servo, current_angle, target_angle, smooth_factor):
+        """
+        Move servo towards a target angle smoothly using interpolation.
+        :param servo: PWM object
+        :param current_angle: Current physical angle
+        :param target_angle: Desired angle
+        :param smooth_factor: Interpolation factor (0.0 to 1.0)
+        :return: New current angle after applying smoothing
+        """
+        if abs(target_angle - current_angle) < 0.1: # If very close, just move directly
+             new_angle = target_angle
+        else:
+            # Calculate the new angle using interpolation
+            new_angle = current_angle + smooth_factor * (target_angle - current_angle)
+        
+        # Clamp the new angle to 0-180 range
+        clamped_new_angle = max(0, min(180, new_angle))
+        
+        # Move the servo to the clamped new angle
+        self.move_to_angle(servo, clamped_new_angle)
+        
+        return clamped_new_angle # Return the actual angle set
+
+
     def set_pan_angle(self, angle):
-        """Set pan servo angle (horizontal)"""
+        """Set target pan servo angle (horizontal) - this will be smoothed in the update loop"""
         with self.lock:
-            self.pan_angle = max(0, min(180, angle))  # Clamp to 0-180
-            self.move_to_angle(self.pan_servo, self.pan_angle)
+            self.target_pan_angle = max(0, min(180, angle))  # Clamp target to 0-180
 
     def set_tilt_angle(self, angle):
-        """Set tilt servo angle (vertical)"""
+        """Set target tilt servo angle (vertical) - this will be smoothed in the update loop"""
         with self.lock:
-            self.tilt_angle = max(0, min(180, angle))  # Clamp to 0-180
-            self.move_to_angle(self.tilt_servo, self.tilt_angle)
+            self.target_tilt_angle = max(0, min(180, angle))  # Clamp target to 0-180
+
+    def update_servos_smoothly(self):
+        """Call this periodically to smoothly update servo angles towards targets."""
+        with self.lock:
+            self.current_pan_angle = self.smooth_move_to_angle(
+                self.pan_servo, self.current_pan_angle, self.target_pan_angle, self.smooth_factor
+            )
+            self.current_tilt_angle = self.smooth_move_to_angle(
+                self.tilt_servo, self.current_tilt_angle, self.target_tilt_angle, self.smooth_factor
+            )
+            # Update the public angle variables for display
+            self.pan_angle = self.current_pan_angle
+            self.tilt_angle = self.current_tilt_angle
 
     def center_servos(self):
-        """Center servos - Pan: 0°, Tilt: 90° (flat/forward)"""
+        """Set target angles to center servos - actual movement happens in update loop"""
         self.set_pan_angle(0)
         self.set_tilt_angle(90)
 
@@ -249,7 +294,7 @@ class PersonDetectorONNX:
 
 # Initialize detector and servo controller
 detector = PersonDetectorONNX('yolov8n.onnx')
-servo_controller = ServoController(pan_pin=17, tilt_pin=27)  # GPIO pins for servos - UPDATED
+servo_controller = ServoController(pan_pin=17, tilt_pin=27, smooth_factor=0.15)  # GPIO pins for servos - UPDATED
 
 # Flask app for web streaming
 app = Flask(__name__)
@@ -264,35 +309,47 @@ tracking_state = {
     "current_tilt": 90        # Start at 90° (flat/forward)
 }
 
+# Global variable to store the selected person's index
+selected_person_index = None
+
 def track_object(boxes_scaled, frame_shape):
     """
-    Calculate servo angles to track the largest person in frame
+    Calculate TARGET servo angles to track the largest person in frame.
+    Servo movement happens in the update loop.
     :param boxes_scaled: Detected bounding boxes in original frame scale
     :param frame_shape: Shape of the original frame
     """
+    global selected_person_index
+    
     # Only track if auto tracking is enabled
     if not tracking_state["auto_tracking"]:
         return
     
     if len(boxes_scaled) == 0:
-        # No detections - center servos (to 0° pan, 90° tilt)
+        # No detections - set target angles to center servos (to 0° pan, 90° tilt)
         servo_controller.center_servos()
-        print("No detections - centering servos to 0° pan, 90° tilt")
+        print("No detections - setting target angles to center (0° pan, 90° tilt)")
+        selected_person_index = None # Clear selection if no person is found
         return
-    
-    # Find largest person (by area)
-    areas = []
-    for box in boxes_scaled:
-        x1, y1, x2, y2 = box
-        area = (x2 - x1) * (y2 - y1)
-        areas.append(area)
-    
-    # Get index of largest person
-    largest_idx = np.argmax(areas)
-    largest_box = boxes_scaled[largest_idx]
-    
-    # Calculate center of largest person
-    x1, y1, x2, y2 = largest_box
+
+    # --- NEW LOGIC: Select person based on selection ---
+    if selected_person_index is not None and selected_person_index < len(boxes_scaled):
+        # Use the selected person if index is valid
+        selected_box = boxes_scaled[selected_person_index]
+        print(f"Tracking selected person at index {selected_person_index}")
+    else:
+        # If no specific person is selected, fall back to largest person
+        areas = []
+        for box in boxes_scaled:
+            x1, y1, x2, y2 = box
+            area = (x2 - x1) * (y2 - y1)
+            areas.append(area)
+        largest_idx = np.argmax(areas)
+        selected_box = boxes_scaled[largest_idx]
+        print(f"Tracking largest person (index {largest_idx})")
+
+    # Calculate center of the selected/primary person
+    x1, y1, x2, y2 = selected_box
     center_x = (x1 + x2) / 2
     center_y = (y1 + y2) / 2
     
@@ -312,30 +369,31 @@ def track_object(boxes_scaled, frame_shape):
     
     # Convert pixel error to angle adjustment (proportional control)
     # Adjust these values based on your desired sensitivity
-    max_angle_change = 15  # Maximum angle change per update to prevent jerky movements
-    pan_adjustment = (error_x / frame_width) * 60  # Max 60° total adjustment range
-    tilt_adjustment = -(error_y / frame_height) * 60  # Invert Y-axis
+    max_angle_change = 10  # Reduced for smoother movement
+    pan_adjustment = (error_x / frame_width) * 40  # Reduced range for smoother movement
+    tilt_adjustment = -(error_y / frame_height) * 40 # Invert Y-axis, reduced range
     
     # Limit the adjustment amount
     pan_adjustment = max(-max_angle_change, min(max_angle_change, pan_adjustment))
     tilt_adjustment = max(-max_angle_change, min(max_angle_change, tilt_adjustment))
     
-    # Get current angles
-    current_pan = servo_controller.pan_angle
-    current_tilt = servo_controller.tilt_angle
+    # Get current target angles
+    current_target_pan = servo_controller.target_pan_angle
+    current_target_tilt = servo_controller.target_tilt_angle
     
-    # Calculate new angles (around 0° pan, 90° tilt center)
-    new_pan = max(0, min(180, current_pan + pan_adjustment))
-    new_tilt = max(0, min(180, current_tilt + tilt_adjustment))
+    # Calculate new target angles (around 0° pan, 90° tilt center)
+    new_target_pan = max(0, min(180, current_target_pan + pan_adjustment))
+    new_target_tilt = max(0, min(180, current_target_tilt + tilt_adjustment))
     
     print(f"Tracking - Center: ({center_x:.1f}, {center_y:.1f}), "
           f"Error: ({error_x:.1f}, {error_y:.1f}), "
-          f"Current: ({current_pan:.1f}, {current_tilt:.1f}), "
-          f"New: ({new_pan:.1f}, {new_tilt:.1f})")
+          f"Current Target: ({current_target_pan:.1f}, {current_target_tilt:.1f}), "
+          f"New Target: ({new_target_pan:.1f}, {new_target_tilt:.1f})")
     
-    # Update servos
-    servo_controller.set_pan_angle(new_pan)
-    servo_controller.set_tilt_angle(new_tilt)
+    # Set the new target angles in the servo controller
+    # The actual smooth movement will happen in the update loop
+    servo_controller.set_pan_angle(new_target_pan)
+    servo_controller.set_tilt_angle(new_target_tilt)
 
 def generate_frames():
     global latest_detection, tracking_state
@@ -347,7 +405,7 @@ def generate_frames():
     
     # Frame rate control
     fps_controller = 0
-    servo_update_interval = 10  # Update servos every 10 frames (was 5)
+    servo_update_interval = 5  # Update servos more frequently (was 10) for smoother motion
     
     while True:
         ret, frame = cap.read()
@@ -369,20 +427,26 @@ def generate_frames():
         else:
             boxes_scaled = np.array([]).reshape(0, 4)  # Empty array with correct shape
         
-        # Track object with servos (every N frames to reduce jitter)
+        # Calculate target servo angles based on detections (every frame or every N frames)
         if fps_controller % servo_update_interval == 0:
             track_object(boxes_scaled, frame.shape)
         
+        # CRITICAL: Update servos smoothly towards their targets (every frame or frequently)
+        servo_controller.update_servos_smoothly()
+
         fps_controller += 1
         
         # Draw ONLY person bounding boxes (green) - only if detections exist
         if len(boxes_scaled) > 0:
-            for box, score in zip(boxes_scaled, scores):
+            for i, (box, score) in enumerate(zip(boxes_scaled, scores)):
                 x1, y1, x2, y2 = map(int, box)
-                label = f"Person: {score:.2f}"
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)  # Thick green box
+                label = f"Person {i}: {score:.2f}"
+                color = (0, 255, 0) # Default green
+                if selected_person_index is not None and i == selected_person_index:
+                    color = (0, 0, 255) # Red for selected person
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)  # Thick box
                 cv2.putText(frame, label, (x1, y1 - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         # Add person count overlay (simplified)
         cv2.rectangle(frame, (10, 10), (150, 50), (0, 0, 0), -1)  # Black background
@@ -391,13 +455,13 @@ def generate_frames():
         
         # Update detection data - convert numpy types to native Python types
         latest_detection = {
-            "boxes": [[int(x) for x in box] for box in boxes_scaled],
+            "boxes": [[int(x) for x in box] for box in boxes_scaled], # Add the coordinates
             "labels": ["person"] * len(class_ids),
             "scores": [float(score.item()) for score in scores] if len(scores) > 0 else [],
             "count": int(person_count),  # Ensure it's a Python int
             "timestamp": time.time(),
-            "pan_angle": float(servo_controller.pan_angle),  # Ensure it's a Python float
-            "tilt_angle": float(servo_controller.tilt_angle),  # Ensure it's a Python float
+            "pan_angle": float(servo_controller.pan_angle),  # Ensure it's a Python float (now reflects actual position)
+            "tilt_angle": float(servo_controller.tilt_angle),  # Ensure it's a Python float (now reflects actual position)
             "manual_control": tracking_state["manual_control"],
             "auto_tracking": tracking_state["auto_tracking"]
         }
@@ -422,7 +486,8 @@ def index():
         <style>
             body { margin: 0; padding: 20px; font-family: Arial, sans-serif; }
             .container { display: flex; flex-direction: column; align-items: center; }
-            #video-feed { border: 2px solid #333; width: 640px; height: 480px; }
+            #detection-canvas-container { position: relative; display: inline-block; }
+            #detection-canvas { border: 2px solid #333; }
             #detection-info { margin-top: 20px; padding: 10px; background: #f0f0f0; border-radius: 5px; }
             .count-display { 
                 font-size: 24px; 
@@ -497,7 +562,10 @@ def index():
     <body>
         <div class="container">
             <h1>Person Detection Stream</h1>
-            <img id="video-feed" src="/video_feed" alt="Person Detection Stream">
+            <div id="detection-canvas-container">
+                <canvas id="detection-canvas" width="640" height="480"></canvas>
+                <img id="video-feed" src="/video_feed" alt="Person Detection Stream" style="display: none;">
+            </div>
             <div id="detection-info">
                 <h3>People Count:</h3>
                 <div class="count-display" id="person-count">0 people detected</div>
@@ -537,6 +605,23 @@ def index():
             const socket = io();
             let manualControlActive = false;
             let autoTrackingActive = true;
+            let selectedPersonIndex = null; // Store the selected index on the client side too
+
+            // Get canvas and context
+            const canvas = document.getElementById('detection-canvas');
+            const ctx = canvas.getContext('2d');
+            const videoFeed = document.getElementById('video-feed');
+
+            // Draw the video feed on the canvas
+            function drawVideo() {
+                if (videoFeed.readyState === videoFeed.HAVE_ENOUGH_DATA) {
+                    ctx.drawImage(videoFeed, 0, 0, canvas.width, canvas.height);
+                }
+                requestAnimationFrame(drawVideo); // Keep drawing
+            }
+
+            // Start drawing the video
+            drawVideo();
 
             socket.on('detection', function(data) {
                 const countDiv = document.getElementById('person-count');
@@ -545,14 +630,70 @@ def index():
 
                 // Update count display
                 countDiv.innerHTML = `Count: ${data.count}`;
-
-                // Update servo angles
                 panAngleDiv.innerHTML = `${data.pan_angle.toFixed(1)}°`;
                 tiltAngleDiv.innerHTML = `${data.tilt_angle.toFixed(1)}°`;
                 
                 // Update button states based on server state
                 updateButtonStates(data.manual_control, data.auto_tracking);
+
+                // --- NEW: Handle bounding boxes ---
+                drawBoundingBoxes(data.boxes); // Call a new function to draw boxes
             });
+
+            // Function to draw bounding boxes on the canvas
+            function drawBoundingBoxes(boxes) {
+                // Clear previous drawings (but keep the video)
+                // We don't clear the canvas completely, just draw over it
+                // The video feed is continuously drawn by drawVideo()
+
+                // Set drawing style for boxes
+                ctx.strokeStyle = 'green';
+                ctx.lineWidth = 3;
+                ctx.font = '16px Arial';
+                ctx.fillStyle = 'green';
+
+                boxes.forEach((box, index) => {
+                    const [x1, y1, x2, y2] = box;
+                    // Draw rectangle
+                    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                    // Optionally draw index or label
+                    ctx.fillText(index, x1, y1 - 5);
+
+                    // Highlight the selected person's box
+                    if (index === selectedPersonIndex) {
+                        ctx.strokeStyle = 'red';
+                        ctx.lineWidth = 5;
+                        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                        ctx.strokeStyle = 'green'; // Reset for next box
+                        ctx.lineWidth = 3;
+                    }
+                });
+
+                // Add click event listener to the canvas to detect clicks within boxes
+                canvas.onclick = function(event) {
+                    const rect = canvas.getBoundingClientRect();
+                    const clickX = event.clientX - rect.left;
+                    const clickY = event.clientY - rect.top;
+
+                    // Check if click is inside any of the boxes
+                    for (let i = 0; i < boxes.length; i++) {
+                        const [x1, y1, x2, y2] = boxes[i];
+                        if (clickX >= x1 && clickX <= x2 && clickY >= y1 && clickY <= y2) {
+                            console.log(`Selected person at index ${i}, box: [${boxes[i]}]`);
+                            // Send the selected index back to the Python script
+                            socket.emit('select_object', { index: i });
+                            selectedPersonIndex = i; // Update client-side selected index
+                            drawBoundingBoxes(boxes); // Re-draw to show highlight
+                            return; // Exit after finding the first matching box
+                        }
+                    }
+                    // If click is outside all boxes, deselect
+                    console.log("Click outside any person box, deselecting.");
+                    socket.emit('select_object', { index: null });
+                    selectedPersonIndex = null; // Clear client-side selection
+                    drawBoundingBoxes(boxes); // Re-draw to remove highlight
+                };
+            }
 
             function updateButtonStates(manual, auto) {
                 manualControlActive = manual;
@@ -597,6 +738,9 @@ def index():
                 const newState = !autoTrackingActive;
                 socket.emit('manual_control', { command: 'toggle_auto', value: newState });
                 console.log(`Toggled auto tracking: ${newState}`);
+                if (!newState) {
+                    selectedPersonIndex = null; // Clear selection if auto tracking is turned off
+                }
             }
 
             function adjustPan(angle) {
@@ -626,19 +770,31 @@ def video_feed():
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@socketio.on('select_object')
+def handle_select_object(data):
+    """Handle object selection from the web interface."""
+    global selected_person_index
+    index = data.get('index', None)
+    if index is not None:
+        selected_person_index = index
+        print(f"Selected person index: {selected_person_index}")
+    else:
+        selected_person_index = None # Deselect if null index is sent
+        print("Deselected person (click outside box)")
+
+
 @socketio.on('manual_control')
 def handle_manual_control(data):
     """Handle manual servo control commands from web interface"""
-    global tracking_state
-    
+    global tracking_state, selected_person_index # Add selected_person_index
     command = data.get('command')
-    
+
     if command == 'calibrate':
-        # Re-calibrate servos with full sweep
         print("Re-calibrating servos (full sweep)...")
         servo_controller.calibrate_servos()
         tracking_state["current_pan"] = 0
         tracking_state["current_tilt"] = 90
+        selected_person_index = None # Clear selection on calibrate
     elif command == 'toggle_manual':
         new_state = data.get('value', False)
         tracking_state["manual_control"] = new_state
@@ -650,7 +806,9 @@ def handle_manual_control(data):
     elif command == 'toggle_auto':
         new_state = data.get('value', True)
         tracking_state["auto_tracking"] = new_state
-        print(f"Auto tracking: {new_state}")
+        if not new_state:
+            selected_person_index = None # Clear selection if auto tracking is turned off
+        print(f"Auto tracking: {new_state}") # Fixed typo: newState -> new_state
     elif command == 'adjust_pan':
         if tracking_state["manual_control"]:
             angle_delta = data.get('value', 0)
@@ -673,7 +831,7 @@ def cleanup():
 def main():
     print("Starting person detection web server with servo tracking...")
     print("Access stream at: http://<raspberry-pi-ip>:5000")
-    print("Pan servo: GPIO 17, Tilt servo: GPIO 27") # Updated print
+    print("Pan servo: GPIO 17, Tilt servo: GPIO 27")
     print("Servos calibrated and set to 0° pan, 90° tilt (flat/forward) center position.")
     
     try:
