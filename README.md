@@ -55,7 +55,7 @@ And log out/in or reboot.
 **Wiring Diagram:**
 ```bash
 **Raspberry Pi GPIO Layout:**
-    [5V] [GPIO 12] [GPIO 13] [GND]
+    [5V] [GPIO 17] [GPIO 27] [GND]
       |      |        |       |
       |   ┌──┴──┐  ┌──┴──┐   |
       |   │Pan  │  │Tilt │   |
@@ -67,13 +67,13 @@ And log out/in or reboot.
 Wiring Connections:
 ```bash
     Pan Servo (Horizontal):
-        Red wire → 5V (Pin 2 or 4)
+        Red wire → 5V (external power)
         Brown/Black wire → GND (Pin 6, 9, 14, 20, 25, 30, 34, or 39)
-        Orange/Yellow wire → GPIO 12 (Pin 32)
+        Orange/Yellow wire → GPIO 17 (Pin 11)
     Tilt Servo (Vertical):
-        Red wire → 5V (Same rail as Pan)
+        Red wire → 5V (external power)
         Brown/Black wire → GND (Same rail as Pan)
-        Orange/Yellow wire → GPIO 13 (Pin 33)
+        Orange/Yellow wire → GPIO 27 (Pin 13)
 ```
 Key Features:
 ```bash
